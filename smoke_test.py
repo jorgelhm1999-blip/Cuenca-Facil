@@ -16,6 +16,7 @@ from engine import (compare_basins, delineate, index_tiles, locate_whitebox,
                     neighboring_tiles, prepare_hydrology, snap_to_flow, snap_to_stream)
 from app import Window
 from ortho import local_ortho_image, pnoa_image
+from diagnostics import diagnostic_preview
 
 
 def main():
@@ -54,6 +55,9 @@ def main():
         accumulation = prepare_hydrology(tiles[1], output, exe, breach_cells=10,
                                          log=lambda text: None)
         assert accumulation.is_file()
+        direction = accumulation.parent/'direccion_d8.tif'
+        assert diagnostic_preview(direction, 'direction', 60, 60).size == (60, 60)
+        assert diagnostic_preview(accumulation, 'accumulation', 60, 60).size == (60, 60)
         preview = SimpleNamespace(accum_path=accumulation, preview=Image.new('RGB', (60, 60)),
                                   threshold=SimpleNamespace(get=lambda: '0,0001'),
                                   draw=lambda: None, _log=lambda text: None, stream_overlay=None,

@@ -19,6 +19,7 @@ from rasterio.vrt import WarpedVRT
 from engine import (compare_basins, delineate, index_tiles, locate_whitebox,
                     neighboring_tiles, prepare_hydrology, snap_to_stream)
 from ortho import local_ortho_image, pnoa_image
+from diagnostics import diagnostic_preview
 
 
 class Window(tk.Tk):
@@ -33,6 +34,9 @@ class Window(tk.Tk):
         self.overlay = None
         self.stream_overlay = None
         self.accum_path = None
+        self.hydro_folder = None
+        self.diagnostic_images = {}
+        self.diagnostic_generation = 0
         self.ortho_preview = None
         self.ortho_source = 'PNOA'
         self.ortho_generation = 0
@@ -58,6 +62,7 @@ class Window(tk.Tk):
         self.threshold = tk.StringVar(value='0,05')
         self.transparency = tk.IntVar(value=0)
         self.audit_selection = tk.StringVar()
+        self.view_mode = tk.StringVar(value='MDT')
         self._layout()
         self.after(120, self._poll)
 
@@ -132,6 +137,13 @@ class Window(tk.Tk):
         ttk.Label(right, text='Vista del MDT', font=('Segoe UI', 12, 'bold')).pack(anchor='w')
         ttk.Label(right, text='Azul: drenaje del MDT · Rueda: acercar · Arrastrar: mover · Clic: vertido',
                   foreground='#586575').pack(anchor='w', pady=(0, 5))
+        views = ttk.Frame(right)
+        views.pack(fill='x', pady=(0, 5))
+        for mode in ('MDT', 'Dirección D8', 'Acumulación'):
+            ttk.Radiobutton(views, text=mode, variable=self.view_mode, value=mode,
+                            command=self.select_view).pack(side='left', padx=(0, 12))
+        self.view_note = ttk.Label(views, text='Altitud (m)', foreground='#586575')
+        self.view_note.pack(side='right')
         map_tools = ttk.Frame(right)
         map_tools.pack(fill='x', pady=(0, 5))
         ttk.Button(map_tools, text='PNOA', command=self.choose_pnoa).pack(side='left', padx=(0, 5))
@@ -246,6 +258,11 @@ class Window(tk.Tk):
             self.accum_path = None
             self.last_run = None
             self.audit_candidates = []
+            self.hydro_folder = None
+            self.diagnostic_images = {}
+            self.diagnostic_generation += 1
+            self.view_mode.set('MDT')
+            self.view_note.configure(text='Altitud (m)')
             self.audit_box['values'] = []
             self.audit_button.configure(state='disabled')
             self.outlet = self.result_outlet = None
@@ -291,6 +308,32 @@ class Window(tk.Tk):
         scale = min(cw/w, ch/h) * self.zoom
         return (cw-w*scale)/2+self.pan_x, (ch-h*scale)/2+self.pan_y, scale
 
+    def select_view(self):
+        mode = self.view_mode.get()
+        self.view_note.configure(text={
+            'MDT': 'Altitud (m)',
+            'Dirección D8': 'Color = vecino receptor; códigos D8: E 1 · NE 2 · N 4 · NW 8 · W 16 · SO 32 · S 64 · SE 128',
+            'Acumulación': 'Color claro = mayor número de celdas aguas arriba (escala logarítmica)',
+        }[mode])
+        if mode != 'MDT' and mode not in self.diagnostic_images:
+            if not self.hydro_folder or not self.preview:
+                self._log('Calcula primero los cauces para consultar esta vista.')
+            else:
+                name = 'direccion_d8.tif' if mode == 'Dirección D8' else 'acumulacion_celdas.tif'
+                path = self.hydro_folder/name
+                if path.is_file():
+                    generation = self.diagnostic_generation
+                    size = self.preview.size
+                    def worker():
+                        try:
+                            image = diagnostic_preview(path, 'direction' if mode == 'Dirección D8'
+                                                       else 'accumulation', *size)
+                            self.events.put(('diagnostic_ready', (generation, mode, image)))
+                        except Exception as exc:
+                            self.events.put(('diagnostic_error', str(exc)))
+                    threading.Thread(target=worker, daemon=True).start()
+        self.draw()
+
     def draw(self):
         self.canvas.delete('all')
         layout = self._layout_image()
@@ -298,10 +341,12 @@ class Window(tk.Tk):
             self.canvas.create_text(200, 160, text='Selecciona una carpeta y un MDT', fill='#5b6b76')
             return
         x0, y0, scale = layout
-        image = self.preview.copy()
-        if self.ortho_preview is not None and self.ortho_preview.size == image.size:
+        mode = self.view_mode.get()
+        diagnostic = self.diagnostic_images.get(mode)
+        image = (diagnostic or self.preview).copy()
+        if mode == 'MDT' and self.ortho_preview is not None and self.ortho_preview.size == image.size:
             image = Image.blend(self.ortho_preview, image, self.transparency.get()/100)
-        if self.stream_overlay is not None and self.stream_overlay.size == image.size:
+        if mode == 'MDT' and self.stream_overlay is not None and self.stream_overlay.size == image.size:
             image = Image.alpha_composite(image.convert('RGBA'), self.stream_overlay).convert('RGB')
         if self.overlay is not None and self.overlay.size == image.size:
             image = Image.alpha_composite(image.convert('RGBA'), self.overlay).convert('RGB')
@@ -568,6 +613,13 @@ class Window(tk.Tk):
                     generation, detail = value
                     if generation == self.ortho_generation:
                         self._log('No se pudo cargar la ortofoto: ' + detail)
+                elif kind == 'diagnostic_ready':
+                    generation, mode, picture = value
+                    if generation == self.diagnostic_generation:
+                        self.diagnostic_images[mode] = picture
+                        if self.view_mode.get() == mode: self.draw()
+                elif kind == 'diagnostic_error':
+                    self._log('No se pudo mostrar el ráster hidrológico: ' + value)
                 elif kind == 'error':
                     self.busy = False
                     self.calculate.configure(state='normal')
@@ -583,6 +635,10 @@ class Window(tk.Tk):
                     self.network_button.configure(state='normal')
                     self.tile_box.configure(state='readonly')
                     self.accum_path = value
+                    self.hydro_folder = Path(value).parent
+                    self.diagnostic_generation += 1
+                    self.diagnostic_images.clear()
+                    self.select_view()
                     self.refresh_stream_overlay()
                     if self.outlet: self.set_point(self.outlet)
                     self.status.set('Cauces calculados. Elige el vertido sobre una línea azul.')
@@ -599,6 +655,10 @@ class Window(tk.Tk):
                     try:
                         self.load_result_preview(destination, Path(result['directorio_final']))
                         self.accum_path = Path(result['directorio_final'])/'acumulacion_celdas.tif'
+                        self.hydro_folder = Path(result['directorio_final'])
+                        self.diagnostic_generation += 1
+                        self.diagnostic_images.clear()
+                        self.select_view()
                         self.refresh_stream_overlay()
                     except Exception as exc:
                         self._log('No se pudo mostrar la máscara en el visor: ' + str(exc))
