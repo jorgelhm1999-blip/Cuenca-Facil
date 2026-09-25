@@ -5,16 +5,20 @@ import queue
 import threading
 import tkinter as tk
 import math
+import json
+import re
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import rasterio
-from PIL import Image, ImageFilter, ImageTk
+from PIL import Image, ImageTk
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 
-from engine import delineate, index_tiles, locate_whitebox, prepare_hydrology, snap_to_stream
+from engine import (compare_basins, delineate, index_tiles, locate_whitebox,
+                    neighboring_tiles, prepare_hydrology, snap_to_stream)
+from ortho import local_ortho_image, pnoa_image
 
 
 class Window(tk.Tk):
@@ -29,6 +33,12 @@ class Window(tk.Tk):
         self.overlay = None
         self.stream_overlay = None
         self.accum_path = None
+        self.ortho_preview = None
+        self.ortho_source = 'PNOA'
+        self.ortho_generation = 0
+        self.current_crs = None
+        self.last_run = None
+        self.audit_candidates = []
         self.outlet = None
         self.result_outlet = None
         self.zoom = 1.0
@@ -46,6 +56,8 @@ class Window(tk.Tk):
         self.x_coord = tk.StringVar()
         self.y_coord = tk.StringVar()
         self.threshold = tk.StringVar(value='0,05')
+        self.transparency = tk.IntVar(value=0)
+        self.audit_selection = tk.StringVar()
         self._layout()
         self.after(120, self._poll)
 
@@ -120,6 +132,14 @@ class Window(tk.Tk):
         ttk.Label(right, text='Vista del MDT', font=('Segoe UI', 12, 'bold')).pack(anchor='w')
         ttk.Label(right, text='Azul: drenaje del MDT · Rueda: acercar · Arrastrar: mover · Clic: vertido',
                   foreground='#586575').pack(anchor='w', pady=(0, 5))
+        map_tools = ttk.Frame(right)
+        map_tools.pack(fill='x', pady=(0, 5))
+        ttk.Button(map_tools, text='PNOA', command=self.choose_pnoa).pack(side='left', padx=(0, 5))
+        ttk.Button(map_tools, text='Ortofoto local…', command=self.choose_local_ortho).pack(side='left')
+        ttk.Label(map_tools, text='Transparencia ortofoto  0%').pack(side='left', padx=(14, 2))
+        tk.Scale(map_tools, variable=self.transparency, from_=0, to=100, orient='horizontal',
+                 length=170, showvalue=False, command=lambda v: self.draw()).pack(side='left')
+        ttk.Label(map_tools, text='100%').pack(side='left')
         self.canvas = tk.Canvas(right, background='#e6eaec', highlightthickness=0, cursor='crosshair')
         self.canvas.pack(expand=True, fill='both')
         self.canvas.bind('<Configure>', lambda e: self.draw())
@@ -129,6 +149,14 @@ class Window(tk.Tk):
         self.canvas.bind('<ButtonPress-1>', self.press)
         self.canvas.bind('<B1-Motion>', self.drag)
         self.canvas.bind('<ButtonRelease-1>', self.release)
+        audit = ttk.Frame(right)
+        audit.pack(fill='x', pady=(8, 3))
+        ttk.Label(audit, text='Comprobar teselas vecinas:').pack(side='left', padx=(0, 6))
+        self.audit_box = ttk.Combobox(audit, state='readonly', textvariable=self.audit_selection, width=43)
+        self.audit_box.pack(side='left', padx=(0, 6))
+        self.audit_button = ttk.Button(audit, text='Auditar y comparar', command=self.audit,
+                                       state='disabled')
+        self.audit_button.pack(side='left')
         ttk.Label(right, text='Proceso', font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(10, 3))
         self.log = tk.Text(right, height=7, state='disabled', wrap='word', font=('Consolas', 9))
         self.log.pack(fill='x')
@@ -165,6 +193,38 @@ class Window(tk.Tk):
         path = filedialog.askopenfilename(title='Ejecutable whitebox_tools')
         if path: self.binary.set(path)
 
+    def choose_pnoa(self):
+        self.ortho_source = 'PNOA'
+        self.request_ortho()
+
+    def choose_local_ortho(self):
+        path = filedialog.askopenfilename(title='Ortofoto georreferenciada',
+                                          filetypes=[('GeoTIFF RGB', '*.tif *.tiff')])
+        if path:
+            self.ortho_source = Path(path)
+            self.request_ortho()
+
+    def request_ortho(self):
+        if not self.preview or not self.preview_bounds or not self.current_crs: return
+        self.ortho_generation += 1
+        generation = self.ortho_generation
+        self.ortho_preview = None
+        self.draw()
+        bounds, crs, width, height = (self.preview_bounds, self.current_crs,
+                                      self.preview.width, self.preview.height)
+        source = self.ortho_source
+        self._log('Cargando ortofoto ' + ('PNOA…' if source == 'PNOA' else str(source)))
+        def worker():
+            try:
+                if source == 'PNOA':
+                    image = pnoa_image(bounds, crs, width, height)
+                else:
+                    image = local_ortho_image(source, bounds, crs, width, height)
+                self.events.put(('ortho_ready', (generation, image)))
+            except Exception as exc:
+                self.events.put(('ortho_error', (generation, str(exc))))
+        threading.Thread(target=worker, daemon=True).start()
+
     def load_preview(self):
         if not self.tiles or self.tile_box.current() < 0: return
         tile = self.tiles[self.tile_box.current()]
@@ -180,9 +240,14 @@ class Window(tk.Tk):
                 grey[np.ma.getmaskarray(arr)] = 230
             self.preview = Image.fromarray(grey, 'L').convert('RGB')
             self.preview_bounds = tuple(tile.bounds)
+            self.current_crs = tile.crs
             self.overlay = None
             self.stream_overlay = None
             self.accum_path = None
+            self.last_run = None
+            self.audit_candidates = []
+            self.audit_box['values'] = []
+            self.audit_button.configure(state='disabled')
             self.outlet = self.result_outlet = None
             self.x_coord.set('')
             self.y_coord.set('')
@@ -191,11 +256,12 @@ class Window(tk.Tk):
             self.point_label.configure(text='Sin seleccionar')
             self.status.set(f'{tile.path.name} · {tile.resolution[0]:g} × {tile.resolution[1]:g} m · {tile.crs}')
             self.draw()
+            self.request_ortho()
         except Exception as exc:
             messagebox.showerror('No se pudo abrir el MDT', str(exc))
 
-    def load_result_preview(self, destination: Path, iteration: int):
-        mosaic = destination / f'pasada_{iteration:02d}' / 'mosaico.tif'
+    def load_result_preview(self, destination: Path, final_directory: Path):
+        mosaic = Path(final_directory) / 'mosaico.tif'
         with rasterio.open(mosaic) as ds:
             factor = max(ds.width / 1200, ds.height / 1200, 1)
             height, width = max(1, round(ds.height/factor)), max(1, round(ds.width/factor))
@@ -207,6 +273,7 @@ class Window(tk.Tk):
             grey[np.ma.getmaskarray(arr)] = 230
             self.preview = Image.fromarray(grey, 'L').convert('RGB')
             self.preview_bounds = tuple(ds.bounds)
+            self.current_crs = ds.crs.to_string()
         with rasterio.open(destination/'cuenca_mascara.tif') as src:
             mask = src.read(1, out_shape=(height, width), resampling=Resampling.nearest)
         color = np.zeros((height, width, 4), dtype='uint8')
@@ -215,6 +282,7 @@ class Window(tk.Tk):
         self.stream_overlay = None
         self.zoom = 1
         self.pan_x = self.pan_y = 0
+        self.request_ortho()
 
     def _layout_image(self):
         cw, ch = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
@@ -231,6 +299,8 @@ class Window(tk.Tk):
             return
         x0, y0, scale = layout
         image = self.preview.copy()
+        if self.ortho_preview is not None and self.ortho_preview.size == image.size:
+            image = Image.blend(self.ortho_preview, image, self.transparency.get()/100)
         if self.stream_overlay is not None and self.stream_overlay.size == image.size:
             image = Image.alpha_composite(image.convert('RGBA'), self.stream_overlay).convert('RGB')
         if self.overlay is not None and self.overlay.size == image.size:
@@ -333,8 +403,7 @@ class Window(tk.Tk):
                                height=h, resampling=Resampling.max) as reduced:
                     data = reduced.read(1, masked=True)
                 network = (data.data >= cells) & (~np.ma.getmaskarray(data))
-            bright = Image.fromarray((network*255).astype('uint8'), 'L').filter(ImageFilter.MaxFilter(3))
-            alpha = np.asarray(bright)
+            alpha = network.astype('uint8')*205
             color = np.zeros((h, w, 4), dtype='uint8')
             color[:, :, 0] = 0
             color[:, :, 1] = 229
@@ -364,6 +433,8 @@ class Window(tk.Tk):
         self.busy = True
         self.calculate.configure(state='disabled')
         self.network_button.configure(state='disabled')
+        self.audit_button.configure(state='disabled')
+        self.tile_box.configure(state='disabled')
         self.status.set('Calculando dirección y acumulación de flujo…')
         tile = self.tiles[self.tile_box.current()]
         destination = Path(self.output.get())
@@ -400,6 +471,8 @@ class Window(tk.Tk):
         self.busy = True
         self.calculate.configure(state='disabled')
         self.network_button.configure(state='disabled')
+        self.audit_button.configure(state='disabled')
+        self.tile_box.configure(state='disabled')
         self.status.set('Calculando. Puede tardar según el tamaño del MDT…')
         point, confirmed = self.outlet, self.result_outlet
         destination = Path(self.output.get())
@@ -409,6 +482,7 @@ class Window(tk.Tk):
             self.busy = False
             self.calculate.configure(state='normal')
             self.network_button.configure(state='normal')
+            self.tile_box.configure(state='readonly')
             messagebox.showerror('Punto fuera del MDT', 'El punto no coincide con una tesela indexada.')
             return
         tile = candidates[0]
@@ -417,7 +491,64 @@ class Window(tk.Tk):
                 result = delineate(self.tiles, tile.path, point, destination, exe, radius,
                                    breach, log=lambda line: self.events.put(('log', line)),
                                    fixed_point=confirmed)
-                self.events.put(('done', (result, destination)))
+                self.events.put(('done', (result, destination, tile.path, point, radius, breach)))
+            except Exception as exc:
+                self.events.put(('error', str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def update_audit_options(self):
+        if not self.last_run:
+            return
+        selected = {Path(path) for path in self.last_run['result']['teselas']}
+        self.audit_candidates = neighboring_tiles(self.tiles, selected)
+        choices = ([f'Todas las teselas vecinas ({len(self.audit_candidates)})'] +
+                   [t.path.name for t in self.audit_candidates]) if self.audit_candidates else []
+        self.audit_box['values'] = choices
+        if self.audit_candidates:
+            self.audit_box.current(1)  # A single tile is the low-cost default.
+            self.audit_button.configure(state='normal')
+            self._log(f'{len(self.audit_candidates)} teselas vecinas sin analizar. Puedes auditar una o todas.')
+        else:
+            self.audit_selection.set('Sin teselas vecinas pendientes')
+            self.audit_button.configure(state='disabled')
+
+    def audit(self):
+        if self.busy or not self.last_run or not self.audit_candidates: return
+        index = self.audit_box.current()
+        if index < 0: return
+        chosen = self.audit_candidates if index == 0 else [self.audit_candidates[index-1]]
+        info = self.last_run
+        original = info['result']
+        seed, point = info['seed'], info['point']
+        fixed = tuple(original['punto_ajustado'])
+        forced = sorted(({Path(p) for p in original['teselas']} - {seed}) |
+                        {t.path for t in chosen})
+        suffix = 'todas' if index == 0 else re.sub(r'[^a-zA-Z0-9_-]', '_', chosen[0].path.stem)
+        destination = info['destination']/('auditoria_'+suffix)
+        try:
+            exe = locate_whitebox(self.binary.get() or None)
+        except FileNotFoundError as exc:
+            messagebox.showerror('Motor', str(exc))
+            return
+        self.busy = True
+        self.calculate.configure(state='disabled')
+        self.network_button.configure(state='disabled')
+        self.audit_button.configure(state='disabled')
+        self.tile_box.configure(state='disabled')
+        self.status.set('Auditando ' + ', '.join(t.path.name for t in chosen) + '…')
+        def worker():
+            try:
+                audit_result = delineate(self.tiles, seed, point, destination, exe,
+                                         info['radius'], info['breach'],
+                                         log=lambda line: self.events.put(('log', line)),
+                                         fixed_point=fixed, forced_tiles=forced)
+                report = compare_basins(info['destination']/'cuenca_mascara.tif',
+                                        destination/'cuenca_mascara.tif',
+                                        destination/'diferencias_auditoria.tif')
+                report['teselas_agregadas_para_auditoria'] = [str(t.path) for t in chosen]
+                (destination/'comparacion.json').write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+                self.events.put(('audit_done', (report, destination, audit_result)))
             except Exception as exc:
                 self.events.put(('error', str(exc)))
         threading.Thread(target=worker, daemon=True).start()
@@ -427,16 +558,30 @@ class Window(tk.Tk):
             while True:
                 kind, value = self.events.get_nowait()
                 if kind == 'log': self._log(value)
+                elif kind == 'ortho_ready':
+                    generation, picture = value
+                    if generation == self.ortho_generation:
+                        self.ortho_preview = picture
+                        self.draw()
+                        self._log('Ortofoto cargada. Transparencia 0% = ortofoto visible.')
+                elif kind == 'ortho_error':
+                    generation, detail = value
+                    if generation == self.ortho_generation:
+                        self._log('No se pudo cargar la ortofoto: ' + detail)
                 elif kind == 'error':
                     self.busy = False
                     self.calculate.configure(state='normal')
                     self.network_button.configure(state='normal')
+                    self.tile_box.configure(state='readonly')
+                    if self.last_run and self.audit_candidates:
+                        self.audit_button.configure(state='normal')
                     self.status.set('No se pudo completar el cálculo.')
                     messagebox.showerror('Error de cálculo', value)
                 elif kind == 'network_ready':
                     self.busy = False
                     self.calculate.configure(state='normal')
                     self.network_button.configure(state='normal')
+                    self.tile_box.configure(state='readonly')
                     self.accum_path = value
                     self.refresh_stream_overlay()
                     if self.outlet: self.set_point(self.outlet)
@@ -445,22 +590,44 @@ class Window(tk.Tk):
                     self.busy = False
                     self.calculate.configure(state='normal')
                     self.network_button.configure(state='normal')
-                    result, destination = value
+                    self.tile_box.configure(state='readonly')
+                    result, destination, seed, point, radius, breach = value
+                    self.last_run = {'result': result, 'destination': destination,
+                                     'seed': seed, 'point': point, 'radius': radius,
+                                     'breach': breach}
                     self.result_outlet = tuple(result['punto_ajustado'])
                     try:
-                        self.load_result_preview(destination, result['iteraciones'])
+                        self.load_result_preview(destination, Path(result['directorio_final']))
                         self.accum_path = Path(result['directorio_final'])/'acumulacion_celdas.tif'
                         self.refresh_stream_overlay()
                     except Exception as exc:
                         self._log('No se pudo mostrar la máscara en el visor: ' + str(exc))
                     self.status.set(f'Área: {result["area_km2"]:.4f} km² · '
-                                    + ('COMPLETA' if result['resultado_completo'] else 'PROVISIONAL'))
+                                    + ('sin borde detectado' if result['resultado_completo'] else 'borde sin cobertura'))
+                    self.update_audit_options()
                     self.draw()
                     messagebox.showinfo('Cuenca delimitada',
                         f'Área: {result["area_km2"]:.4f} km²\n'
                         f'Teselas usadas: {len(result["teselas"])}\n'
-                        f'Estado: {"completa" if result["resultado_completo"] else "PROVISIONAL; faltan datos en un borde"}\n\n'
+                        f'Cobertura: {"sin corte detectado" if result["resultado_completo"] else "faltan datos en un borde"}\n'
+                        f'Vecinas aún sin analizar: {len(self.audit_candidates)}\n\n'
                         f'Resultados: {destination}')
+                elif kind == 'audit_done':
+                    self.busy = False
+                    self.calculate.configure(state='normal')
+                    self.network_button.configure(state='normal')
+                    self.audit_button.configure(state='normal')
+                    self.tile_box.configure(state='readonly')
+                    report, destination, audit_result = value
+                    message = (f'Original: {report["area_original_km2"]:.4f} km²\n'
+                               f'Con tesela adicional: {report["area_auditoria_km2"]:.4f} km²\n'
+                               f'Solo en la original: {report["solo_original_km2"]:.4f} km²\n'
+                               f'Solo en la auditoría: {report["solo_auditoria_km2"]:.4f} km²\n'
+                               f'Coincidencia espacial: {report["coincidencia_porcentaje"]:.2f}%\n\n'
+                               f'Diferencias y nueva cuenca: {destination}')
+                    self._log(message.replace('\n', ' | '))
+                    self.status.set('Auditoría completada. Consulta diferencias_auditoria.tif.')
+                    messagebox.showinfo('Comparación de teselas', message)
         except queue.Empty: pass
         self.after(120, self._poll)
 

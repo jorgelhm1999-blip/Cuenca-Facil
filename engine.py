@@ -44,8 +44,8 @@ def index_tiles(folder: Path) -> tuple[list[Tile], list[str]]:
                        and p.stem != 'cuenca_mascara'):
         try:
             with rasterio.open(path) as ds:
-                if ds.count < 1 or not ds.crs or not ds.crs.is_projected:
-                    raise ValueError('necesita una banda y un CRS proyectado')
+                if ds.count != 1 or not ds.crs or not ds.crs.is_projected:
+                    raise ValueError('necesita una sola banda de elevación y un CRS proyectado')
                 if not math.isclose(ds.crs.linear_units_factor[1], 1.0, rel_tol=1e-7):
                     raise ValueError('el CRS horizontal debe estar en metros')
                 t = ds.transform
@@ -71,6 +71,26 @@ def compatible(base: Tile, other: Tile) -> bool:
         if abs(delta - round(delta)) > 1e-5:
             return False
     return True
+
+
+def neighboring_tiles(tiles: list[Tile], selected: set[Path]) -> list[Tile]:
+    """Compatible catalog tiles sharing an edge or corner with the selected mosaic."""
+    if not selected:
+        return []
+    lookup = {t.path: t for t in tiles}
+    anchor = lookup[next(iter(selected))]
+    tolerance = min(anchor.resolution)*.1
+    found = []
+    for tile in tiles:
+        if tile.path in selected or not compatible(anchor, tile):
+            continue
+        for chosen in selected:
+            a, b = tile.bounds, lookup[chosen].bounds
+            if (a[0] <= b[2]+tolerance and a[2] >= b[0]-tolerance and
+                    a[1] <= b[3]+tolerance and a[3] >= b[1]-tolerance):
+                found.append(tile)
+                break
+    return sorted(found, key=lambda t: str(t.path))
 
 
 def locate_whitebox(explicit: str | None = None) -> Path:
@@ -346,7 +366,8 @@ def export_results(folder: Path, watershed: Path, dem: Path, metadata: dict) -> 
 
 def delineate(tiles: list[Tile], seed: Path, point: tuple[float, float], out: Path,
               whitebox: Path, snap_radius: float = 12, breach_cells: int = 50,
-              log: Log = print, fixed_point: tuple[float, float] | None = None) -> dict:
+              log: Log = print, fixed_point: tuple[float, float] | None = None,
+              forced_tiles: list[Path] | None = None) -> dict:
     if not tiles or seed not in {t.path for t in tiles}:
         raise ValueError('Selecciona una tesela indexada.')
     if snap_radius < 0 or breach_cells < 1:
@@ -358,13 +379,18 @@ def delineate(tiles: list[Tile], seed: Path, point: tuple[float, float], out: Pa
         raise ValueError('El punto debe estar en la tesela inicial.')
     out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    selected = {seed}
+    forced = set(forced_tiles or [])
+    if not forced.issubset(lookup):
+        raise ValueError('Hay teselas de auditoría fuera del catálogo.')
+    if any(not compatible(base, lookup[p]) for p in forced):
+        raise ValueError('Las teselas de auditoría deben tener el mismo CRS y retícula.')
+    selected = {seed} | forced
     exe = locate_whitebox(str(whitebox))
     result = {}
     if fixed_point and math.dist(point, fixed_point) > snap_radius + 1e-7:
         raise ValueError('El punto confirmado excede el radio máximo de ajuste.')
     for iteration in range(len(tiles)+1):
-        cached = iteration == 0 and cached_hydrology(out/'preparacion', base, exe, breach_cells)
+        cached = iteration == 0 and not forced and cached_hydrology(out/'preparacion', base, exe, breach_cells)
         work = out/'preparacion' if cached else out / f'pasada_{iteration+1:02d}'
         work.mkdir(exist_ok=True)
         dem, prepared, pntr, accum = hydro_paths(work)
@@ -400,6 +426,8 @@ def delineate(tiles: list[Tile], seed: Path, point: tuple[float, float], out: Pa
                   [str(p) for p in sorted(incompatible)], 'bordes_sin_cobertura': uncovered,
                   'resultado_completo': not (incompatible or uncovered),
                   'iteraciones': iteration+1, 'directorio_final': str(work),
+                  'teselas_forzadas': [str(p) for p in sorted(forced)],
+                  'teselas_vecinas_no_analizadas': [str(t.path) for t in neighboring_tiles(tiles, selected)],
                   'motor': 'WhiteboxTools: BreachDepressionsLeastCost, D8Pointer, D8FlowAccumulation, Watershed'}
         if not additions:
             export_results(out, basin, dem, result)
@@ -410,3 +438,37 @@ def delineate(tiles: list[Tile], seed: Path, point: tuple[float, float], out: Pa
         log('La cuenca alcanza el borde: incorporando ' + ', '.join(p.name for p in sorted(additions)))
         selected.update(additions)
     raise RuntimeError('No se pudo completar la expansión de teselas.')
+
+
+def compare_basins(original: Path, audited: Path, destination: Path) -> dict:
+    """Compare both basin rasters on the audit grid; report gained and lost pixels."""
+    from rasterio.vrt import WarpedVRT
+    destination = Path(destination)
+    original = Path(original)
+    audited = Path(audited)
+    with rasterio.open(original) as old, rasterio.open(audited) as new:
+        if old.crs != new.crs or old.res != new.res:
+            raise ValueError('No coinciden las proyecciones o resoluciones de las dos cuencas.')
+        profile = new.profile.copy()
+        profile.update(dtype='uint8', count=1, nodata=0, compress='deflate', tiled=True,
+                       blockxsize=256, blockysize=256)
+        only_old = only_new = common = 0
+        with WarpedVRT(old, crs=new.crs, transform=new.transform, width=new.width,
+                       height=new.height, resampling=Resampling.nearest,
+                       nodata=0, src_nodata=0) as on_new, rasterio.open(destination, 'w', **profile) as diff:
+            for _, win in new.block_windows(1):
+                old_arr = on_new.read(1, window=win) > 0
+                new_arr = new.read(1, window=win) > 0
+                gained = new_arr & ~old_arr
+                lost = old_arr & ~new_arr
+                only_new += int(gained.sum())
+                only_old += int(lost.sum())
+                common += int((old_arr & new_arr).sum())
+                diff.write((gained.astype('uint8')*2 + lost.astype('uint8')), 1, window=win)
+        pixel_area = abs(new.transform.a*new.transform.e)
+        return {'area_original_km2': (common+only_old)*pixel_area/1e6,
+                'area_auditoria_km2': (common+only_new)*pixel_area/1e6,
+                'solo_original_km2': only_old*pixel_area/1e6,
+                'solo_auditoria_km2': only_new*pixel_area/1e6,
+                'diferencia_simetrica_km2': (only_old+only_new)*pixel_area/1e6,
+                'coincidencia_porcentaje': 100*common/max(1, common+only_old+only_new)}
