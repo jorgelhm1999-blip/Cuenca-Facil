@@ -1,0 +1,30 @@
+name: Construir aplicacion privada para Windows
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Preparar el motor hidrologico
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://www.whiteboxgeo.com/WBT_Windows/WhiteboxTools_win_amd64.zip' -OutFile whitebox.zip
+          Expand-Archive whitebox.zip -DestinationPath whitebox_download
+          $engine = Get-ChildItem whitebox_download -Filter whitebox_tools.exe -Recurse | Select-Object -First 1
+          if (-not $engine) { throw 'No se encontro whitebox_tools.exe en el paquete.' }
+          New-Item bin -ItemType Directory -Force | Out-Null
+          Copy-Item $engine.FullName bin/whitebox_tools.exe
+      - name: Empaquetar la app
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name CuencaFacil --add-binary "bin/whitebox_tools.exe;bin" --collect-all rasterio --collect-all fiona app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CuencaFacil-Windows
+          path: dist/CuencaFacil/
